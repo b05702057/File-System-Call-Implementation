@@ -16,15 +16,15 @@
 #define	syscallExit		1
 #define	syscallExec		2
 #define	syscallJoin		3
-#define	syscallCreate		4
+#define	syscallCreate	4
 #define	syscallOpen		5
 #define	syscallRead		6
-#define	syscallWrite		7
-#define	syscallClose		8
-#define	syscallUnlink		9
+#define	syscallWrite	7
+#define	syscallClose	8
+#define	syscallUnlink	9
 #define syscallMmap		10
-#define syscallConnect		11
-#define syscallAccept		12
+#define syscallConnect	11
+#define syscallAccept	12
 
 /* Don't want the assembler to see C code, but start.s includes syscall.h. */
 #ifndef START_S

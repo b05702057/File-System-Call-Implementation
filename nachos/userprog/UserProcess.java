@@ -1,11 +1,14 @@
 package nachos.userprog;
 
 import nachos.machine.*;
+
 import nachos.threads.*;
 import nachos.userprog.*;
 import nachos.vm.*;
 
 import java.io.EOFException;
+import java.util.HashMap;
+import java.util.*;
 
 /**
  * Encapsulates the state of a user process that is not contained in its user
@@ -14,7 +17,7 @@ import java.io.EOFException;
  * 
  * <p>
  * This class is extended by other classes to support additional functionality
- * (such as additional syscalls).
+ * (such as additional system calls).
  * 
  * @see nachos.vm.VMProcess
  * @see nachos.network.NetProcess
@@ -26,10 +29,20 @@ public class UserProcess {
 	public UserProcess() {
 		int numPhysPages = Machine.processor().getNumPhysPages();
 		pageTable = new TranslationEntry[numPhysPages];
+		vaUpperBound = numPhysPages * pageSize;
 		for (int i = 0; i < numPhysPages; i++)
 			pageTable[i] = new TranslationEntry(i, i, true, false, false, false);
-	}
+		for (int i = 2; i <= 15; i++)  // initialize the heap with fileDescriptors of 2 ~ 15 (0 and 1 are already used)
+			pQueue.add(i);
 
+		OpenFile stdin = UserKernel.console.openForReading();
+		OpenFile stdout = UserKernel.console.openForWriting();
+		map.put(0, stdin);
+		map.put(1, stdout);
+		map2.put(stdin.getName(), 1);
+		map2.put(stdout.getName(), 1);
+	}
+	
 	/**
 	 * Allocate and return a new process of the correct class. The class name is
 	 * specified by the <tt>nachos.conf</tt> key
@@ -362,7 +375,7 @@ public class UserProcess {
 	 * Handle the exit() system call.
 	 */
 	private int handleExit(int status) {
-	        // Do not remove this call to the autoGrader...
+	    // Do not remove this call to the autoGrader...
 		Machine.autoGrader().finishingCurrentProcess(status);
 		// ...and leave it as the top of handleExit so that we
 		// can grade your implementation.
@@ -374,19 +387,179 @@ public class UserProcess {
 		return 0;
 	}
 
+	private int handleCreate(int vaName) {
+		if (pQueue.isEmpty()) {  // All fileDescriptors are used.
+			return -1;
+		}	
+		String vaNameString = readVirtualMemoryString(vaName, 256); // the maximum size is 256 bytes
+		if (map2.containsKey(vaNameString)) { // already exists
+			return handleOpen(vaName);
+		}
+		else {  // new file
+			OpenFile newFile = ThreadedKernel.fileSystem.open(vaNameString, true); // use open(_, true) to create a file
+			return modifyQueueMap(vaNameString, newFile);
+		}	
+	}
+
+	// opening the same file multiple times returns different file descriptors for each open
+	private int handleOpen(int vaName) {
+		if (pQueue.isEmpty()) { // all fileDescriptors are used
+			return -1;
+		}
+		String vaNameString = readVirtualMemoryString(vaName, 256); // the maximum size is 256 bytes
+		// If the file doesn't exist in the file system, the return OpenFile will be null.
+		OpenFile newFile = ThreadedKernel.fileSystem.open(vaNameString, false); // use open(_, false) to open a file
+		return modifyQueueMap(vaNameString, newFile) ;
+	}
+	
+	// modify the queue and maps when we open a file
+	private int modifyQueueMap(String vaNameString, OpenFile newFile) {
+		if (newFile == null) { // fail to create/open the file
+			return -1;
+		}
+		int fileDescriptor = pQueue.remove(); // get the smallest available fileDescriptor 
+		map.put(fileDescriptor, newFile);
+		if (!map2.containsKey(vaNameString)) {  // The file doesn't exist before.
+			map2.put(vaNameString, 0);
+		}
+		map2.put(vaNameString, map2.get(vaNameString) + 1);
+		return fileDescriptor;
+	}
+	
+	private int handleClose(int fileDescriptor) {
+		if (map.containsKey(fileDescriptor)) {  // the file exists
+			OpenFile curFile = map.get(fileDescriptor);  // get the file with the file descriptor
+			curFile.close();  // release the resource held by the file
+
+			map.remove(fileDescriptor);
+			
+			String vaNameString = curFile.getName();
+			map2.put(vaNameString, map2.get(vaNameString) - 1);
+			// If we unlink a file and close all corresponding file descriptors, the file needs to be created again next time.
+			if (map2.get(vaNameString) == 0) {  // The file is not associated with any file descriptors now, which means it is not open.
+				map2.remove(vaNameString);
+			}
+			if (fileDescriptor > 1) {  // the fileDesctiptor can be used by other files now
+				pQueue.add(fileDescriptor); 
+			}
+			return 0;
+		}
+		return -1; // the file does not exist (we don't know which file the fileDescriptor indicates)
+	}
+	
+	// The existing OpenFiles can still be accessed even though the file is unlinked (disappear from the file system).
+	private int handleUnlink(int vaName) {
+		String vaNameString = readVirtualMemoryString(vaName, 256);  // the maximum size is 256 bytes	
+		boolean removed = ThreadedKernel.fileSystem.remove(vaNameString);
+		if (!removed) { // didn't remove successfully
+			return -1;
+		}
+		return 0;
+	}
+	
+	// Normally, user programs read from STDIN to know the input and write to STDOUT to show the output.
+	// There will not be test cases of writing to STDIN and reading from STDOUT, so we don't have to deal with them.
+	private int handleRead(int fileDescriptor, int buffer, int count) {
+		if (count < 0 || !map.containsKey(fileDescriptor)) {  // count < 0 or invalid file descriptor
+			return -1;
+		}
+		OpenFile curFile = map.get(fileDescriptor);
+		
+		// If the user program has no input, length() and tell() of STDIN will always return -1.
+		int fileLength = curFile.length();
+		int filePosition = curFile.tell();
+		if (count == 0 || fileLength == 0) {  // return 0 with empty file even with a bad buffer
+			return 0;
+		}
+
+		int fileLeft = fileLength - filePosition;
+		count = Math.min(count, fileLeft);
+
+		if (buffer < 0 || buffer + count >= vaUpperBound) { // check if the buffer and byte count to read is valid
+			return -1;
+		}
+		
+		int totalByteRead = 0;  // the number of total bytes we have successfully read
+		int byteRead = 0;  // the number of successfully read byte in the first step
+		int finalByteRead = 0;  // the number of successfully read byte in the second step
+		int curCount = 0;  // the number of bytes we want to read in this iteration
+		
+		while (count > 0) {  // still need to read
+			curCount = Math.min(pageSize, count);  // curCount <= pageSize (the size of the buffer)
+			byte[] byteArray = new byte[curCount];  // We use a page-sized buffer to pass data from the file to the user memory.
+			byteRead = curFile.read(byteArray, 0, curCount);  // the number of bytes read
+			if (byteRead == 0) {  // We have reached the end of the file.
+				return totalByteRead;  // simply return the number of bytes we have read (prevent infinite loop)
+			}
+			if (byteRead == -1) {  // some errors happen
+				return -1;
+			}
+
+			// copy the elements to a shorter array because the writeVirtualMemory function will try to use the full array
+			byte[] byteArray2 = new byte[byteRead];  
+			for (int i = 0; i < byteRead; i++) {
+				byteArray2[i] = byteArray[i];
+			}
+
+			// try to write everything in the byteArray into the user memory
+			finalByteRead = writeVirtualMemory(buffer + totalByteRead, byteArray2); 
+			if (finalByteRead != byteRead){
+				return -1;
+			}
+			totalByteRead += finalByteRead;
+			count -= finalByteRead;
+		}
+		return totalByteRead;
+	}
+	
+	private int handleWrite(int fileDescriptor, int buffer, int count) {
+		if (count < 0 || !map.containsKey(fileDescriptor)) {  // check if the byte count to read and the file descriptor is valid
+			return -1;
+		}
+		if (count == 0){  // no need to read anything (return 0 even though the buffer is invalid)
+			return 0;
+		}
+		if (buffer < 0 || buffer + count >= vaUpperBound) {  // Some part of the buffer is invalid.
+			return -1;
+		}
+		
+		int totalByteWritten = 0;  // the number of total bytes we have successfully written
+		int byteWritten = 0;  // the number of successfully written byte in the first step
+		int finalByteWritten = 0;  // the number of successfully written byte in the second step
+		int curCount = 0;  // the number of bytes we want to write this iteration
+		OpenFile curFile = map.get(fileDescriptor);
+
+		while (count > 0) {  // still need to write
+			curCount = Math.min(pageSize, count);  // The size of the byteArray matters because readVirtualMemory() reads as much as the array can handle
+			byte[] byteArray = new byte[curCount];  // use a page-sized buffer to pass data from the user memory to the file
+			byteWritten = readVirtualMemory(buffer + totalByteWritten, byteArray);  // read data from the user buffer to the kernel buffer
+			if (byteWritten == 0){  // fail to write anything
+				return -1;
+			}
+
+			finalByteWritten = curFile.write(byteArray, 0, byteWritten);  // Since we always declare a new byteArray, the offset is 0.
+			if (finalByteWritten == -1) {  // fail to write data to the file
+				return -1;
+			}
+			totalByteWritten += finalByteWritten; // totalByteWritten helps us know where we should start reading the process buffer
+			count -= finalByteWritten;
+		}
+		return totalByteWritten;
+	}
+
 	private static final int syscallHalt = 0, syscallExit = 1, syscallExec = 2,
 			syscallJoin = 3, syscallCreate = 4, syscallOpen = 5,
 			syscallRead = 6, syscallWrite = 7, syscallClose = 8,
 			syscallUnlink = 9;
 
 	/**
-	 * Handle a syscall exception. Called by <tt>handleException()</tt>. The
-	 * <i>syscall</i> argument identifies which syscall the user executed:
+	 * Handle a system call exception. Called by <tt>handleException()</tt>. The
+	 * <i>system call</i> argument identifies which system call the user executed:
 	 * 
 	 * <table>
 	 * <tr>
-	 * <td>syscall#</td>
-	 * <td>syscall prototype</td>
+	 * <td>system call#</td>
+	 * <td>system call prototype</td>
 	 * </tr>
 	 * <tr>
 	 * <td>0</td>
@@ -433,11 +606,11 @@ public class UserProcess {
 	 * </tr>
 	 * </table>
 	 * 
-	 * @param syscall the syscall number.
-	 * @param a0 the first syscall argument.
-	 * @param a1 the second syscall argument.
-	 * @param a2 the third syscall argument.
-	 * @param a3 the fourth syscall argument.
+	 * @param syscall the system call number.
+	 * @param a0 the first system call argument.
+	 * @param a1 the second system call argument.
+	 * @param a2 the third system call argument.
+	 * @param a3 the fourth system call argument.
 	 * @return the value to be returned to the user.
 	 */
 	public int handleSyscall(int syscall, int a0, int a1, int a2, int a3) {
@@ -446,6 +619,22 @@ public class UserProcess {
 			return handleHalt();
 		case syscallExit:
 			return handleExit(a0);
+		case syscallExec:
+			return 0;
+		case syscallJoin:
+			return 0;
+		case syscallCreate:
+			return handleCreate(a0);
+		case syscallOpen:
+			return handleOpen(a0);
+		case syscallRead:
+			return handleRead(a0, a1, a2);
+		case syscallWrite:
+			return handleWrite(a0, a1, a2);
+		case syscallClose:
+			return handleClose(a0);
+		case syscallUnlink:
+			return handleUnlink(a0);
 
 		default:
 			Lib.debug(dbgProcess, "Unknown syscall " + syscall);
@@ -482,6 +671,7 @@ public class UserProcess {
 		}
 	}
 
+	// The methods or data members declared as protected can be accessed in restricted situations.
 	/** The program being run by this process. */
 	protected Coff coff;
 
@@ -500,6 +690,15 @@ public class UserProcess {
 	private int initialPC, initialSP;
 
 	private int argc, argv;
+	
+	protected int vaUpperBound;  // the value would be initialized for each process
+	
+	protected HashMap<Integer, OpenFile> map = new HashMap<>();  // {key: value} of {fileDescriptor: openFile}
+	
+	// We need this map to know if the file is already created.
+	protected HashMap<String, Integer> map2 = new HashMap<>();  // {key: value} of {fileName: the number of associated fileDescriptors}
+	
+	protected PriorityQueue<Integer> pQueue = new PriorityQueue<Integer>();  // storing available fileDesctiptors
 
 	private static final int pageSize = Processor.pageSize;
 

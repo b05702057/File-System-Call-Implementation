@@ -114,7 +114,7 @@ public class SynchConsole {
 
 	private class File extends OpenFile {
 		File(boolean canRead, boolean canWrite) {
-			super(null, "SynchConsole");
+			super(null, "SynchConsole");  // initialize the file system and the file name
 
 			this.canRead = canRead;
 			this.canWrite = canWrite;
